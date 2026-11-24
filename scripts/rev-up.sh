@@ -7,11 +7,7 @@ NAME="${1:-rev-$(date +%H%M%S)}"
 START_URL="${2:-about:blank}"
 STATE_DIR="${WEBTOP_REV_STATE:-${TMPDIR:-/tmp}/webtop-reverse}"
 IMAGE="${WEBTOP_REV_IMAGE:-webtop-reverse:latest}"
-# 容器里的 127.0.0.1 指向容器自己，必须用宿主机桥接地址才能复用宿主代理
-# 优先 docker0 网桥地址（172.17.0.1），退回默认路由网关
-BRIDGE_IP="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
-GW="$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')"
-PROXY="${WEBTOP_REV_PROXY:-http://${BRIDGE_IP:-${GW:-172.17.0.1}}:7893}"
+PROXY="${WEBTOP_REV_PROXY:-}"
 
 mkdir -p "$STATE_DIR"
 PROFILE_VOL="webtop-rev-${NAME}-profile"
@@ -22,16 +18,20 @@ if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
   exit 1
 fi
 
-# 分配随机空闲端口
+# 容器内 127.0.0.1 指向容器自己，要用宿主机桥接地址才能复用宿主代理
+BRIDGE_IP="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
+GW="$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')"
+PROXY="${WEBTOP_REV_PROXY:-http://${BRIDGE_IP:-${GW:-172.17.0.1}}:7893}"
+
 pick_port() {
   python3 - <<'PY'
 import socket
 s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()
 PY
 }
-VNC_PORT="$(pick_port)"
 CDP_PORT="$(pick_port)"
-while [ "$CDP_PORT" = "$VNC_PORT" ]; do CDP_PORT="$(pick_port)"; done
+while [ "$CDP_PORT" = "$(pick_port)" ]; do :; done
+VNC_PORT="$(pick_port)"
 
 echo "[*] 启动容器 $NAME ..."
 docker run -d \
@@ -41,15 +41,13 @@ docker run -d \
   --restart=no \
   -p "127.0.0.1:${VNC_PORT}:3000" \
   -p "127.0.0.1:${CDP_PORT}:9223" \
-  -e "http_proxy=${PROXY}" \
-  -e "https_proxy=${PROXY}" \
-  -e "HTTP_PROXY=${PROXY}" \
-  -e "HTTPS_PROXY=${PROXY}" \
+  -e "http_proxy=${PROXY}" -e "https_proxy=${PROXY}" \
+  -e "HTTP_PROXY=${PROXY}" -e "HTTPS_PROXY=${PROXY}" \
   -v "${PROFILE_VOL}:/config/chrome-profile" \
   "$IMAGE" >/dev/null
 
-# 等 CDP 就绪
-for i in $(seq 1 40); do
+# 等 CDP 就绪（容器内 Chromium 随机端口 -> 桥接固定端口 9223）
+for i in $(seq 1 45); do
   if curl -sf --max-time 2 "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1; then
     break
   fi
@@ -58,8 +56,19 @@ done
 
 if ! curl -sf --max-time 3 "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1; then
   echo "[!] CDP 未就绪，日志：" >&2
-  docker logs --tail 20 "$NAME" >&2
+  docker logs --tail 30 "$NAME" >&2
+  docker exec "$NAME" sh -c 'cat /config/logs/chromium.log 2>/dev/null | tail -20' >&2 || true
   exit 1
+fi
+
+# 生成供 chrome-devtools-mcp --autoConnect 使用的 DevToolsActivePort。
+# 注意要写「宿主机」CDP 端口，因为 autoConnect 在宿主机侧读这个文件并连 127.0.0.1:<port>；
+# 容器内真实端口由 cdp-bridge 转发到宿主机映射端口。
+SHIM_DIR="$STATE_DIR/${NAME}-autoconnect"
+mkdir -p "$SHIM_DIR"
+WS_PATH="$(docker exec "$NAME" sh -c 'sed -n 2p /config/chrome-profile/DevToolsActivePort 2>/dev/null' | tr -d '\r' || true)"
+if [ -n "$WS_PATH" ]; then
+  printf '%s\n%s\n' "$CDP_PORT" "$WS_PATH" > "$SHIM_DIR/DevToolsActivePort"
 fi
 
 # 打开起始页
@@ -74,8 +83,10 @@ cat > "$STATE_FILE" <<EOF
   "cdp_port": $CDP_PORT,
   "vnc_url": "http://127.0.0.1:${VNC_PORT}/",
   "cdp_url": "http://127.0.0.1:${CDP_PORT}",
+  "autoconnect_user_data_dir": "$SHIM_DIR",
   "profile_volume": "${PROFILE_VOL}",
   "start_url": "$START_URL",
+  "proxy": "$PROXY",
   "created": "$(date -Is)"
 }
 EOF
@@ -85,6 +96,7 @@ cat <<EOF
 [$NAME] 已就绪
   noVNC  (人工登录):  http://127.0.0.1:${VNC_PORT}/    [本机可直连]
   CDP    (逆向调试):  http://127.0.0.1:${CDP_PORT}
+  autoConnect 目录:  $SHIM_DIR   (给 chrome-devtools-mcp --autoConnect --userDataDir 用)
   状态文件:          $STATE_FILE
   代理:              $PROXY
 

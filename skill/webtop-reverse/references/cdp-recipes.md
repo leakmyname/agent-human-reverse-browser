@@ -14,12 +14,9 @@ tab = [t for t in tabs if t["type"] == "page"][0]
 ws = websocket.create_connection(tab["webSocketDebuggerUrl"], suppress_origin=True)
 
 ident = [0]
-def send(method, params=None, session=None):
+def send(method, params=None):
     ident[0] += 1
-    msg = {"id": ident[0], "method": method, "params": params or {}}
-    if session:
-        msg["sessionId"] = session
-    ws.send(json.dumps(msg))
+    ws.send(json.dumps({"id": ident[0], "method": method, "params": params or {}}))
     while True:
         r = json.loads(ws.recv())
         if r.get("id") == ident[0]:
@@ -40,7 +37,7 @@ for c in r["result"]["cookies"]:
     print(c["name"], c["value"][:20], "httpOnly=", c.get("httpOnly"))
 ```
 
-`document.cookie` 拿不到 HttpOnly，必须走 CDP。
+`document.cookie` 和 `cookieStore.getAll()` 都拿不到 HttpOnly，必须走 CDP。
 
 ## 记录网络请求
 
@@ -50,7 +47,7 @@ send("Network.setCacheDisabled", {"cacheDisabled": True})
 # 之后监听 ws 消息里的 Network.requestWillBeSent / Network.responseReceived
 ```
 
-要落盘成 HAR 可用 `Page.getResourceContent` 逐个抓，或直接读容器的 `/config/chrome-profile` 里 Chromium 自己的网络缓存。
+回溯请求来源用 `Network.requestWillBeSent` 事件里的 `initiator` 字段（type 为 `script` 时含 `stackTrace`）。
 
 ## 注入 hook 采样
 
@@ -80,8 +77,18 @@ r = send("Page.captureScreenshot", {"format": "png"})
 open("shot.png", "wb").write(base64.b64decode(r["result"]["data"]))
 ```
 
+容器里 Chromium 走 SwiftShader 软渲染，首次截图可能要几秒；超时的话调大等待时间。
+
+## 打开新标签页
+
+```python
+send("Target.createTarget", {"url": "https://example.com"})
+```
+
+或直接用 `<repo>/scripts/cdp-open.py <cdp_base> <url>`。
+
 ## 注意
 
 - 目标页面若在 iframe 里，`/json` 会多出 `type=iframe` 的条目，筛选时只取 `type=page`。
 - 页面跳转后 target id 会变，重连前先刷新 `/json`。
-- 容器内 Chromium 是 136.x，KasmVNC 的 Xvnc 桌面尺寸 1920x1080，截图默认按视口而非全屏。
+- 容器内 Chromium 是 158.x，Selkies 桌面分辨率 1024x768（浏览器窗口 1920x1080）。
